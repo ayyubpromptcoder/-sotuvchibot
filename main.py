@@ -78,6 +78,14 @@ sotuvchi_menu = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🔐 Sotuvchilar Parollari", callback_data="admin_seller_passwords")],
 ])
 
+# main.py ichida, 5-bo'lim (Tugmalar) qismiga qo'shing.
+
+# Sotuvchi asosiy menyusi (Reply Keyboard)
+seller_main_menu = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False, keyboard=[
+    [KeyboardButton(text="📦 Mahsulotlarim")],
+    [KeyboardButton(text="💰 Qarzdorligim")]
+])
+
 # --- 6. HANDLERS (Umumiy va Admin Buyruqlar) ---
 
 @dp.message(Command("start"))
@@ -109,6 +117,39 @@ async def handle_sotuvchi(message: types.Message):
         "Sotuvchilar bo'limi:\nQuyidagi amallardan birini tanlang:",
         reply_markup=sotuvchi_menu
     )
+
+    # main.py ichida, 6-bo'limdan keyin, yoki 10-bo'limga qo'shing
+
+from db import check_seller_password_and_link_id # Ushbu funksiya db.py da bo'lishi kerak
+
+@dp.message(SellerState.waiting_for_login_password, F.text)
+async def process_seller_login_password(message: types.Message, state: FSMContext):
+    """Sotuvchi tomonidan kiritilgan parolni tekshirish."""
+    password = message.text.strip()
+    user_id = message.from_user.id
+    
+    try:
+        seller = await check_seller_password_and_link_id(password, user_id)
+        
+        if seller:
+            await message.answer(
+                f"✅ Tizimga muvaffaqiyatli kirdingiz, **{seller.name}**!\n"
+                f"Endi siz o'z ma'lumotlaringizni ko'rishingiz mumkin.",
+                reply_markup=seller_main_menu,
+                parse_mode="Markdown"
+            )
+            await state.clear()
+            # Sotuvchi ID ni saqlash (Keyingi so'rovlar uchun kerak emas, chunki u DB ga yozildi)
+            
+        else:
+            await message.answer(
+                "❌ Parol noto'g'ri yoki allaqachon boshqa foydalanuvchi ushbu parol bilan ro'yxatdan o'tgan.\n"
+                "Iltimos, qaytadan urinib ko'ring yoki /start bosing."
+            )
+            
+    except Exception as e:
+        logger.error(f"Sotuvchi kirishda xato: {e}")
+        await message.answer("Tizimda xato yuz berdi. Iltimos, keyinroq urinib ko'ring.")
 
 # --- 7. ADMIN CALLBACK BOSHQARUVI ---
 
@@ -328,6 +369,208 @@ async def start_give_product_to_seller(callback: types.CallbackQuery, state: FSM
 
 # Qolgan FSM qismlari (Mahsulot nomi, soni, yangi narx) shu yerga qo'shiladi...
 
+# main.py ichida, 10-bo'lim ostida davom etamiz.
+
+@dp.message(AdminState.waiting_for_product_name_for_seller, F.text)
+async def process_seller_product_name(message: types.Message, state: FSMContext):
+    """Sotuvchiga beriladigan mahsulot nomini qabul qilish."""
+    if not is_admin(message.from_user.id): return
+    
+    product_name = message.text.strip()
+    await state.update_data(product_name=product_name)
+    
+    # DB dan mahsulotni qidirish
+    product = await get_product_by_name(product_name)
+    
+    if product:
+        # 1. Mahsulot bazada mavjud. Narxni so'rash shart emas, sonini so'raymiz.
+        await state.update_data(product_id=product.id, product_price=product.price)
+        await message.answer(
+            f"Mahsulot **{product.name}** (Narxi: {product.price:,} so'm) bazada topildi.\n"
+            f"Endi ushbu mahsulotdan **necha dona** berilganini kiriting (faqat raqam):"
+            .replace(",", " ")
+        )
+        await state.set_state(AdminState.waiting_for_product_quantity_for_seller)
+    else:
+        # 2. Mahsulot bazada mavjud emas. Yangi mahsulot sifatida narxini so'raymiz.
+        await message.answer(
+            f"Mahsulot **{product_name}** bazada topilmadi.\n"
+            f"Iltimos, ushbu yangi mahsulotning **narxini** kiriting (masalan: 12500):"
+        )
+        await state.set_state(AdminState.waiting_for_new_product_price_for_seller)
+
+@dp.message(AdminState.waiting_for_new_product_price_for_seller, F.text)
+async def process_new_product_price_for_seller(message: types.Message, state: FSMContext):
+    """Yangi mahsulot uchun narxni qabul qilish va DB ga kiritish."""
+    if not is_admin(message.from_user.id): return
+
+    try:
+        price = int(message.text.strip())
+        if price <= 0: raise ValueError
+    except ValueError:
+        return await message.answer("Narx noto'g'ri formatda. Iltimos, faqat musbat butun son kiriting.")
+
+    data = await state.get_data()
+    product_name = data['product_name']
+    
+    try:
+        # Yangi mahsulotni yaratish va ID sini olish
+        new_product, is_new = await get_or_create_product(name=product_name, price=price)
+        
+        await state.update_data(product_id=new_product.id, product_price=new_product.price)
+        
+        await message.answer(
+            f"✅ Yangi mahsulot **{new_product.name}** (Narxi: {new_product.price:,} so'm) bazaga qo'shildi.\n"
+            f"Endi ushbu mahsulotdan **necha dona** berilganini kiriting (faqat raqam):"
+            .replace(",", " ")
+        )
+        await state.set_state(AdminState.waiting_for_product_quantity_for_seller)
+
+    except Exception as e:
+        logger.error(f"Yangi mahsulot kiritishda xato (Sotuvchiga berish): {e}")
+        await message.answer("Mahsulotni kiritishda xato yuz berdi. Iltimos, qaytadan urinib ko'ring.")
+        await state.clear()
+
+
+@dp.message(AdminState.waiting_for_product_quantity_for_seller, F.text)
+async def process_seller_product_quantity(message: types.Message, state: FSMContext):
+    """Mahsulot sonini qabul qilish va sotuvchiga tovar berishni yakunlash."""
+    if not is_admin(message.from_user.id): return
+
+    try:
+        quantity = int(message.text.strip())
+        if quantity <= 0: raise ValueError
+    except ValueError:
+        return await message.answer("Miqdor noto'g'ri. Iltimos, musbat butun son kiriting.")
+
+    data = await state.get_data()
+    seller_id = data['current_seller_id']
+    product_id = data['product_id']
+    product_price = data['product_price'] 
+
+    try:
+        # Ma'lumotni DB ga yozish (Sotuvchi_Mahsulotlari jadvaliga)
+        await add_product_to_seller(
+            seller_id=seller_id,
+            product_id=product_id,
+            quantity=quantity
+        )
+        
+        total_cost = quantity * product_price
+        
+        await message.answer(
+            f"✅ **Muvaffaqiyatli!** Tovar berildi.\n\n"
+            f"Sotuvchi: **{data['seller_name']}**\n"
+            f"Mahsulot ID: {product_id} ({data.get('product_name', 'Mavjud')})\n"
+            f"Miqdor: **{quantity} dona**\n"
+            f"Jami Qarzdorlikka Qo'shildi: **{total_cost:,} so'm**"
+            .replace(",", " "), parse_mode="Markdown"
+        )
+        await state.clear()
+        
+    except Exception as e:
+        logger.error(f"Sotuvchiga tovar berishda xato: {e}")
+        await message.answer("Ma'lumotni saqlashda kutilmagan xato yuz berdi. Iltimos, qaytadan urinib ko'ring.")
+        await state.clear()
+
+        # main.py ichida, 10-bo'lim ostida davom etamiz.
+
+@dp.callback_query(F.data.startswith("seller_debt_"))
+async def show_seller_debt(callback: types.CallbackQuery):
+    """Sotuvchining barcha mahsulotlari ro'yxati va jami qarzdorligini chiqaradi."""
+    if not is_admin(callback.from_user.id): return await callback.answer("Ruxsat yo'q.")
+    await callback.answer()
+    
+    seller_id = int(callback.data.split('_')[-1])
+    seller = await get_seller_by_id(seller_id)
+    
+    if not seller:
+        return await callback.message.answer("Sotuvchi topilmadi.")
+
+    # DB dan sotuvchining mahsulotlari va umumiy summasini olish
+    products_list, total_debt = await get_seller_products_info(seller_id)
+    
+    text = f"💰 **{seller.name}** ({seller.neighborhood}) dagi Mahsulotlar Ro'yxati:\n\n"
+    
+    if not products_list:
+        text += "Hozircha sotuvchida mahsulot yo'q (Qarzdorlik 0 so'm)."
+    else:
+        for i, item in enumerate(products_list, 1):
+            product_name = item['product_name']
+            quantity = item['quantity']
+            unit_price = item['unit_price']
+            subtotal = item['subtotal']
+            
+            text += (
+                f"{i}. **{product_name}**\n"
+                f"   Miqdor: {quantity} dona\n"
+                f"   Narxi: {unit_price:,} so'm (dona)\n"
+                f"   Summa: **{subtotal:,} so'm**\n"
+            ).replace(",", " ")
+
+        text += "\n"
+        text += f"**💵 JAMI QARZDORLIK SUMMASI:** **{total_debt:,} so'm**".replace(",", " ")
+
+    await callback.message.answer(text, parse_mode="Markdown")
+
+    # main.py ichida, 10-bo'limga qo'shing
+
+from db import get_seller_by_telegram_id # Ushbu funksiya db.py da bo'lishi kerak
+
+async def check_seller_access(message: types.Message):
+    """Sotuvchi huquqini tekshirish va Seller obyektini qaytarish."""
+    if is_admin(message.from_user.id):
+        # Agar admin o'z buyruqlarini bosgan bo'lsa, uni qo'yib yuborish
+        return True, None
+        
+    seller = await get_seller_by_telegram_id(message.from_user.id)
+    if not seller:
+        await message.answer("Siz tizimga kirmagan ko'rinasiz. Iltimos, /start buyrug'ini bosing va parolingizni kiriting.")
+        return False, None
+    return True, seller
+
+
+@dp.message(F.text == "📦 Mahsulotlarim")
+async def show_seller_products(message: types.Message):
+    access, seller = await check_seller_access(message)
+    if not access or is_admin(message.from_user.id): return
+
+    # Sotuvchi mahsulotlari funksiyasini chaqirish (Admin qismida bor)
+    products_list, total_debt = await get_seller_products_info(seller.id)
+    
+    text = f"📦 **{seller.name}** dagi Mahsulotlaringiz:\n\n"
+    
+    if not products_list:
+        text += "Hozircha sizda mahsulot yo'q."
+    else:
+        for i, item in enumerate(products_list, 1):
+            product_name = item['product_name']
+            quantity = item['quantity']
+            unit_price = item['unit_price']
+            
+            text += (
+                f"{i}. **{product_name}** - {unit_price:,} so'm\n"
+                f"   Miqdor: **{quantity} dona**\n"
+            ).replace(",", " ")
+
+    await message.answer(text, parse_mode="Markdown")
+
+
+@dp.message(F.text == "💰 Qarzdorligim")
+async def show_seller_debt_total(message: types.Message):
+    access, seller = await check_seller_access(message)
+    if not access or is_admin(message.from_user.id): return
+
+    products_list, total_debt = await get_seller_products_info(seller.id)
+    
+    text = f"💰 **{seller.name}** uchun umumiy qarzdorlik:\n\n"
+    
+    if total_debt == 0:
+        text += "Ayni damda sizda qarzdorlik yo'q. Baraka toping!"
+    else:
+        text += f"**💵 JAMI QARZDORLIK SUMMASI:** **{total_debt:,} so'm**".replace(",", " ")
+
+    await message.answer(text, parse_mode="Markdown")
 
 # --- 11. BOTNI ISHGA TUSHIRISH FUNKSIYASI ---
 
