@@ -1,7 +1,7 @@
 import logging
-import asyncio
-import os
-from dotenv import load_dotenv
+import asyncio    # Asyncio Google Sheets logi uchun
+import os         # OS - Atrof-muhit o'zgaruvchilarini o'qish uchun
+from dotenv import load_dotenv # Dotenv - .env faylini yuklash uchun
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -12,10 +12,60 @@ from aiogram.exceptions import TelegramBadRequest
 
 # Loyihaning ichki modullarini import qilish
 from db_models import Base, Product, Seller, SellerProduct
-from db import init_db, get_or_create_product, add_new_seller, get_all_products, get_all_sellers, get_seller_by_id, get_product_by_name, add_product_to_seller, get_seller_products_info, get_all_seller_passwords_list
-
+from db import (
+    init_db, get_or_create_product, add_new_seller, get_all_products, get_all_sellers, 
+    get_seller_by_id, get_product_by_name, add_product_to_seller, get_seller_products_info, 
+    get_all_seller_passwords_list,
+    # 👇 LOGIN UCHUN KERAKLI FUNKSIYALAR 👇
+    check_seller_password_and_link_id, 
+    get_seller_by_telegram_id
+    # Agar Google Sheets integratsiyasi bo'lsa:
+    # , log_transaction_to_sheet 
+)
+from integrations import log_transaction_to_sheet
 # .env faylini yuklash
 load_dotenv()
+
+from db import get_all_sellers_total_debt # Bu funksiyani db.py'dan import qilish kerak
+
+@dp.callback_query(F.data == "admin_seller_total_info")
+async def show_all_sellers_total_debt(callback: types.CallbackQuery):
+    """Barcha sotuvchilarning umumiy mahsulotlari/qarzdorligini chiqaradi."""
+    if not is_admin(callback.from_user.id): return await callback.answer("Ruxsat yo'q.")
+    await callback.answer()
+    
+    try:
+        # DB'dan barcha sotuvchilar va ularning umumiy qarzdorligini olish
+        total_info_list = await get_all_sellers_total_debt()
+    except Exception as e:
+        logger.error(f"Umumiy qarzdorlikni olishda xato: {e}")
+        return await callback.message.answer("Ma'lumotlarni yuklashda xato yuz berdi.")
+
+    if not total_info_list:
+        text = "Bazada hozircha sotuvchilarning mahsulotlari bo'yicha ma'lumot yo'q."
+        total_debt_sum = 0
+    else:
+        text = "💰 **Sotuvchilar Bo'yicha JAMI Mahsulotlar Ro'yxati:**\n\n"
+        total_debt_sum = 0
+        
+        for i, item in enumerate(total_info_list, 1):
+            seller_name = item['seller_name']
+            total_debt = item['total_debt']
+            total_debt_sum += total_debt
+
+            # Mahsulotlarni ro'yxatlash (agar barcha mahsulotlar ko'rsatilishi kerak bo'lsa)
+            # Hozircha faqat umumiy summani ko'rsataman.
+            
+            text += (
+                f"{i}. **{seller_name}**:\n"
+                f"   Qarzdorlik: **{total_debt:,} so'm**\n"
+            ).replace(",", " ")
+
+    text += "\n"
+    text += f"---"
+    text += f"\n**WORLD WIDE JAMI QARZDORLIK SUMMASI:** **{total_debt_sum:,} so'm**".replace(",", " ")
+    
+    await callback.message.answer(text, parse_mode="Markdown")
 
 # --- 1. Konfiguratsiya ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -399,44 +449,12 @@ async def process_seller_product_name(message: types.Message, state: FSMContext)
         )
         await state.set_state(AdminState.waiting_for_new_product_price_for_seller)
 
-@dp.message(AdminState.waiting_for_new_product_price_for_seller, F.text)
-async def process_new_product_price_for_seller(message: types.Message, state: FSMContext):
-    """Yangi mahsulot uchun narxni qabul qilish va DB ga kiritish."""
-    if not is_admin(message.from_user.id): return
-
-    try:
-        price = int(message.text.strip())
-        if price <= 0: raise ValueError
-    except ValueError:
-        return await message.answer("Narx noto'g'ri formatda. Iltimos, faqat musbat butun son kiriting.")
-
-    data = await state.get_data()
-    product_name = data['product_name']
-    
-    try:
-        # Yangi mahsulotni yaratish va ID sini olish
-        new_product, is_new = await get_or_create_product(name=product_name, price=price)
-        
-        await state.update_data(product_id=new_product.id, product_price=new_product.price)
-        
-        await message.answer(
-            f"✅ Yangi mahsulot **{new_product.name}** (Narxi: {new_product.price:,} so'm) bazaga qo'shildi.\n"
-            f"Endi ushbu mahsulotdan **necha dona** berilganini kiriting (faqat raqam):"
-            .replace(",", " ")
-        )
-        await state.set_state(AdminState.waiting_for_product_quantity_for_seller)
-
-    except Exception as e:
-        logger.error(f"Yangi mahsulot kiritishda xato (Sotuvchiga berish): {e}")
-        await message.answer("Mahsulotni kiritishda xato yuz berdi. Iltimos, qaytadan urinib ko'ring.")
-        await state.clear()
-
-
 @dp.message(AdminState.waiting_for_product_quantity_for_seller, F.text)
 async def process_seller_product_quantity(message: types.Message, state: FSMContext):
     """Mahsulot sonini qabul qilish va sotuvchiga tovar berishni yakunlash."""
     if not is_admin(message.from_user.id): return
 
+    # 1. Miqdor (quantity)ni tekshirish
     try:
         quantity = int(message.text.strip())
         if quantity <= 0: raise ValueError
@@ -447,9 +465,10 @@ async def process_seller_product_quantity(message: types.Message, state: FSMCont
     seller_id = data['current_seller_id']
     product_id = data['product_id']
     product_price = data['product_price'] 
+    seller_name = data['seller_name'] # Qulaylik uchun
 
+    # 2. DB ga yozish va Javob qaytarish
     try:
-        # Ma'lumotni DB ga yozish (Sotuvchi_Mahsulotlari jadvaliga)
         await add_product_to_seller(
             seller_id=seller_id,
             product_id=product_id,
@@ -457,11 +476,23 @@ async def process_seller_product_quantity(message: types.Message, state: FSMCont
         )
         
         total_cost = quantity * product_price
+
+        # >>> GOOGLE SHEETSGA YOZISHNI ASINXRON CHAQIRISH
+        # Funksiya ishlamay qolsa ham asosiy bot ishlashda davom etadi
+        asyncio.create_task(log_transaction_to_sheet(
+            seller_name=seller_name,
+            product_name=data.get('product_name', 'Mahsulot (ID: ' + str(product_id) + ')'),
+            quantity=quantity,
+            price=product_price,
+            total_cost=total_cost
+        ))
+        # <<<
         
+        # Muvaffaqiyatli yakunlanganda yuboriladigan yakuniy javob
         await message.answer(
             f"✅ **Muvaffaqiyatli!** Tovar berildi.\n\n"
-            f"Sotuvchi: **{data['seller_name']}**\n"
-            f"Mahsulot ID: {product_id} ({data.get('product_name', 'Mavjud')})\n"
+            f"Sotuvchi: **{seller_name}**\n"
+            f"Mahsulot: {data.get('product_name', 'Mavjud')}\n"
             f"Miqdor: **{quantity} dona**\n"
             f"Jami Qarzdorlikka Qo'shildi: **{total_cost:,} so'm**"
             .replace(",", " "), parse_mode="Markdown"
@@ -469,11 +500,49 @@ async def process_seller_product_quantity(message: types.Message, state: FSMCont
         await state.clear()
         
     except Exception as e:
-        logger.error(f"Sotuvchiga tovar berishda xato: {e}")
+        # DB ga yozish yoki sheetsga yozishda xato bo'lsa
+        logger.error(f"Sotuvchiga tovar berishda yoki Sheetsga yozishda xato: {e}")
         await message.answer("Ma'lumotni saqlashda kutilmagan xato yuz berdi. Iltimos, qaytadan urinib ko'ring.")
         await state.clear()
 
+
+
         # main.py ichida, 10-bo'lim ostida davom etamiz.
+
+@dp.message(AdminState.waiting_for_new_product_price_for_seller, F.text)
+async def process_new_seller_product_price(message: types.Message, state: FSMContext):
+    """Yangi mahsulot narxini qabul qilish, mahsulotni bazaga qo'shish va keyin miqdorni so'rash."""
+    if not is_admin(message.from_user.id): return
+
+    try:
+        new_price = int(message.text.strip())
+        if new_price <= 0: raise ValueError
+    except ValueError:
+        return await message.answer("Narx noto'g'ri formatda. Iltimos, faqat musbat butun son kiriting.")
+
+    data = await state.get_data()
+    product_name = data['product_name']
+
+    try:
+        # 1. Yangi mahsulotni bazaga qo'shish
+        product, is_new = await get_or_create_product(name=product_name, price=new_price)
+        
+        # 2. Keyingi holat uchun ma'lumotlarni yangilash
+        await state.update_data(product_id=product.id, product_price=product.price)
+        
+        await message.answer(
+            f"✅ Yangi mahsulot **{product_name}** ({product.price:,} so'm) bazaga qo'shildi.\n"
+            f"Endi ushbu mahsulotdan **necha dona** berilganini kiriting (faqat raqam):"
+            .replace(",", " ")
+        )
+        
+        # 3. Keyingi qadam: Miqdorni so'rash
+        await state.set_state(AdminState.waiting_for_product_quantity_for_seller)
+
+    except Exception as e:
+        logger.error(f"Yangi mahsulot kiritishda xato: {e}")
+        await message.answer("Mahsulotni yaratishda kutilmagan xato yuz berdi. Iltimos, qaytadan urinib ko'ring.")
+        await state.clear()
 
 @dp.callback_query(F.data.startswith("seller_debt_"))
 async def show_seller_debt(callback: types.CallbackQuery):
