@@ -10,6 +10,15 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
+
+# --- 1. Konfiguratsiya ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_ID = int(os.getenv("ADMIN_ID")) if os.getenv("ADMIN_ID") else None
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
 # Loyihaning ichki modullarini import qilish
 from db_models import Base, Product, Seller, SellerProduct
 from db import (
@@ -67,17 +76,10 @@ async def show_all_sellers_total_debt(callback: types.CallbackQuery):
     
     await callback.message.answer(text, parse_mode="Markdown")
 
-# --- 1. Konfiguratsiya ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = int(os.getenv("ADMIN_ID")) if os.getenv("ADMIN_ID") else None
 
 # Global sozlamalar
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
 
 # --- 2. Admin Vaziyatlari (FSM - Holat Boshqaruvi) ---
 class AdminState(StatesGroup):
